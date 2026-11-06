@@ -1,0 +1,79 @@
+name: Spec check
+
+# Runs on every PR that touches entries/. CI checks conformance only,
+# never performance. The score comes from the load test on the
+# reference machine with the published k6 script.
+#
+# Note: first-time contributors need organizer approval before the run.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "entries/**"
+      - "spec-check.sh"
+      - ".github/workflows/spec-check.yml"
+
+jobs:
+  spec-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so we can diff PR files
+
+      - name: Guard - one entry per PR, only inside entries/<username>/
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.sha }}"
+          changed=$(git diff --name-only "$BASE" "$HEAD")
+          echo "Changed files:"
+          echo "$changed"
+
+          bad=$(echo "$changed" | grep -v '^entries/[^/]\+/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Every changed file must be inside entries/<your-username>/. Offending files:"
+            echo "$bad"
+            exit 1
+          fi
+
+          dirs=$(echo "$changed" | grep '^entries/' | cut -d/ -f2 | sort -u)
+          count=$(echo "$dirs" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Exactly one entry folder per PR (entries/<username>), found $count."
+            exit 1
+          fi
+          echo "entry=entries/$dirs" >> "$GITHUB_ENV"
+
+      - name: Build the entry
+        run: docker build -t entry "${{ env.entry }}"
+
+      - name: Start with the standard command (no --rm: the kill -9 test needs the disk layer to survive)
+        run: |
+          docker run -d --name challenge \
+            --cpuset-cpus=0 --memory=2g --memory-swap=2g \
+            -p 8080:8080 entry
+
+      - name: Wait for the app to come up
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:8080/feed; then
+              echo "App is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::App did not answer GET /feed within 30s"
+          docker logs challenge
+          exit 1
+
+      - name: Spec check (walks all seven endpoints + kill -9 durability test)
+        run: ./spec-check.sh challenge
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs challenge
+
+      - name: Always clean up the container
+        if: always()
+        run: docker rm -f challenge
