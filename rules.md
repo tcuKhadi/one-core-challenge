@@ -19,9 +19,14 @@
 - Simulated user count includes only users actually running the loop. No idle connections inflating the score.
 
 ## State and durability
-- Every run starts cold: container stopped, database empty.
+- Every run starts cold: the container is removed and recreated, so the writable layer - and the database inside it - starts empty. No entry ships a pre-baked database in its image.
 - SQLite runs with `synchronous=FULL`. Every write is saved to disk (fsynced) before the server replies.
 - Spot check: during a run, the server process gets `kill -9` and the container is restarted. All writes must still exist, or the run is void.
+
+## Disk budget
+- At least 10 GB free on the server before any scoring run; record `df` before and after each run.
+- A run is void if free space drops below 2 GB during or after it - a full disk invalidates results, and no entry or load behavior may rely on unbounded disk,
+- Tracking: a scoring run adds single-digit MBs (a few hundred thousand small rows). Disk space is not the constraint; synced-write speed is.
 
 ## Honest behavior
 - No hard-coded answers.

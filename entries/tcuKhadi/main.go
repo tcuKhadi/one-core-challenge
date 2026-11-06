@@ -6,6 +6,7 @@ package main
 
 import (
 	"database/sql"
+	_ "embed"
 	"log"
 	"net/http"
 	"os"
@@ -23,32 +24,11 @@ var (
 	usernameRe = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS posts (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	username   TEXT NOT NULL,
-	content    TEXT NOT NULL,
-	created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS likes (
-	id      INTEGER PRIMARY KEY AUTOINCREMENT,
-	post_id INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS comments (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	post_id    INTEGER NOT NULL,
-	username   TEXT NOT NULL,
-	content    TEXT NOT NULL,
-	created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS users (
-	username       TEXT PRIMARY KEY,
-	profile_visits INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_likes_post    ON likes(post_id);
-CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-CREATE INDEX IF NOT EXISTS idx_posts_user    ON posts(username);
-`
+// schema is embedded from schema.sql so the SQL is its own reviewable artifact
+// (go:embed keeps it in the binary — the Dockerfile copies it next to main.go).
+//
+//go:embed schema.sql
+var schemaSQL string
 
 type comment struct {
 	PostID    int64  `json:"post_id"`
@@ -353,7 +333,7 @@ func main() {
 	// Simple, predictable, reference-grade. Speed was not the goal.
 	db.SetMaxOpenConns(1)
 
-	if _, err = db.Exec(schema); err != nil {
+	if _, err = db.Exec(schemaSQL); err != nil {
 		log.Fatal("schema:", err)
 	}
 
