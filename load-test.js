@@ -3,7 +3,7 @@
 //
 // Load level: one passing level per run (fixed steps of +50 users).
 // A run passes if it holds the level for 5 minutes with:
-//   - under 1% errors (timeouts, resets, 5xx)
+//   - under 1% errors (timeouts, resets, 5xx, schema/status violations)
 //   - 95% of replies under 500 ms
 // k6 exit code: 0 = level passed, anything else = level failed.
 // Threshold breaches abort the run early, so a dead level costs no time.
@@ -11,27 +11,24 @@
 // Usage:  k6 run -e TARGET=<users> load-test.js
 // Smoke:  k6 run -e TARGET=10 -e DURATION=30s load-test.js
 // Record: k6 run -e TARGET=<users> --summary-export results/level_<users>.json load-test.js
-//         (keep the JSONs + exit codes, that is the score table per level)
 //
-// Env:   TARGET  simulated users for this level (default 300)
-//        DURATION how long the level holds (default 5m)
-//        RAMP    time to spin VUs up before the hold (default 30s)
-//        BASE    app base URL (default http://localhost:8080)
-//
-// One simulated user (rules.md): GET /feed -> GET /posts/:id ->
-// one write (POST /posts/:id/like or POST /posts/:id/comments) ->
-// GET /users/:username, pausing 2-5 s between actions.
+// Env:    TARGET    simulated users for this level (default 300)
+//         DURATION  how long the level holds (default 5m)
+//         RAMP      time to spin VUs up before the hold (default 60s per rules.md)
+//         BASE      app base URL (default http://localhost:8080)
+//         JWT_SECRET HMAC secret for JWT tokens (default one-core-challenge-secret)
 // ============================================================
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import exec from 'k6/execution';
+import { makeToken } from './lib/token.js';
 
 const BASE = __ENV.BASE || 'http://localhost:8080';
+const SECRET = __ENV.JWT_SECRET || 'one-core-challenge-secret';
 const TARGET = __ENV.TARGET ? Number(__ENV.TARGET) : 300;
 const DURATION = __ENV.DURATION || '5m';
-const RAMP = __ENV.RAMP || '30s';
-const SEEDS = 20; // seed users/posts so every user has things to read and like
+const RAMP = __ENV.RAMP || '60s';
 
 const JSON_HDRS = { 'Content-Type': 'application/json' };
 const thinkSeconds = () => 2 + Math.random() * 3;
@@ -42,74 +39,112 @@ export const options = {
       executor: 'ramping-vus',
       startVUs: 0,
       stages: [
-        { duration: RAMP, target: TARGET },      // reach the level fast, ramp does not count
-        { duration: DURATION, target: TARGET },  // hold, this is what is scored
+        { duration: RAMP, target: TARGET },
+        { duration: DURATION, target: TARGET },
       ],
       gracefulRampDown: '0s',
     },
   },
   thresholds: {
-    // Errors: failed requests count timeouts, resets, and 5xx, per rules.md
+    // Errors: failed requests count timeouts, resets, 5xx, and check failures
     http_req_failed: [{ threshold: 'rate<0.01', abortOnFail: true }],
+    checks: [{ threshold: 'rate>0.99', abortOnFail: true }],
     http_req_duration: [{ threshold: 'p(95)<500', abortOnFail: true }],
   },
 };
 
-// Run setup on the load machine, against a cold-started server.
-// Seeds 20 posts so every simulated user has content immediately.
+function authHeaders(token) {
+  return {
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+  };
+}
+
 export function setup() {
-  const up = http.get(`${BASE}/feed`);
-  if (up.status !== 200) {
-    throw new Error(`server did not start answering: GET /feed -> ${up.status}`);
+  // Verify server is reachable and seed data is present
+  const feedRes = http.get(`${BASE}/feed`);
+  if (feedRes.status !== 200) {
+    throw new Error(`server unreachable: GET /feed -> ${feedRes.status}`);
   }
 
-  const ids = [];
-  for (let i = 1; i <= SEEDS; i++) {
-    const res = http.post(
-      `${BASE}/posts`,
-      JSON.stringify({ username: `seed_${i}`, content: `benchmark post ${i}` }),
-      { headers: JSON_HDRS }
-    );
-    const ok = check(res, { 'seed post created': (r) => r.status === 201 });
-    if (ok) ids.push(res.json().id);
+  const posts = feedRes.json('posts');
+  if (!posts || posts.length === 0) {
+    throw new Error('database is not seeded. Run seed.js before starting load-test.js');
   }
-  if (ids.length < SEEDS) {
-    throw new Error(`seeding failed: created ${ids.length}/${SEEDS} posts`);
+
+  // Pre-generate tokens for up to 1,000 active users (matching seed data user0000-user0999)
+  const tokens = [];
+  for (let i = 0; i < 1000; i++) {
+    const username = 'user' + String(i).padStart(4, '0');
+    tokens.push({
+      username,
+      token: makeToken(username, SECRET, 86400),
+    });
   }
-  return { ids };
+
+  return { tokens };
 }
 
 export default function (data) {
-  // 1. GET /feed (newest posts)
+  // Simulated user assignment (user0000 - user0999)
+  const userObj = data.tokens[(exec.vu.idInTest - 1) % data.tokens.length];
+  const userHeaders = authHeaders(userObj.token);
+
+  // 1. GET /feed
   const feedRes = http.get(`${BASE}/feed`, { tags: { name: 'GET /feed' } });
-  check(feedRes, { 'feed is 200': (r) => r.status === 200 });
+  const feedOk = check(feedRes, {
+    'feed status is 200': (r) => r.status === 200,
+    'feed has posts array': (r) => Array.isArray(r.json('posts')) && r.json('posts').length > 0,
+  });
   sleep(thinkSeconds());
 
-  // 2. GET /posts/:id (one post with counts)
-  // Always a known-good seed id: the feed list would work too, but a fixed
-  // id keeps every user hitting identical work at every level.
-  const id = data.ids[Math.floor(Math.random() * data.ids.length)];
-  const postRes = http.get(`${BASE}/posts/${id}`, { tags: { name: 'GET /posts/:id' } });
-  check(postRes, { 'post is 200': (r) => r.status === 200 });
-  sleep(thinkSeconds());
-
-  // 3. one durable write: like or comment, 50/50
-  const username = `seed_${1 + (exec.vu.idInTest % SEEDS)}`;
-  if (Math.random() < 0.5) {
-    const likeRes = http.post(`${BASE}/posts/${id}/like`, null, { tags: { name: 'POST like' } });
-    check(likeRes, { 'like is 201': (r) => r.status === 201 });
+  // 2. GET /posts/:id (select post from feed or seed range 1..10000)
+  let postId = 1;
+  if (feedOk) {
+    const posts = feedRes.json('posts');
+    postId = posts[Math.floor(Math.random() * posts.length)].id;
   } else {
-    const comRes = http.post(
-      `${BASE}/posts/${id}/comments`,
-      JSON.stringify({ username, content: 'load test comment' }),
-      { headers: JSON_HDRS, tags: { name: 'POST comment' } }
+    postId = 1 + Math.floor(Math.random() * 10000);
+  }
+
+  const postRes = http.get(`${BASE}/posts/${postId}`, { tags: { name: 'GET /posts/:id' } });
+  check(postRes, {
+    'post status is 200': (r) => r.status === 200,
+    'post id matches': (r) => r.json('post.id') === postId,
+  });
+  sleep(thinkSeconds());
+
+  // 3. One write: like or comment (50/50)
+  if (Math.random() < 0.5) {
+    const likeRes = http.post(`${BASE}/posts/${postId}/like`, null, Object.assign({}, userHeaders, {
+      tags: { name: 'POST /posts/:id/like' },
+    }));
+    // 201 if first like by user, 200 if duplicate like
+    check(likeRes, {
+      'like status is 200 or 201': (r) => r.status === 201 || r.status === 200,
+      'like response has post_id': (r) => r.json('post_id') === postId,
+    });
+  } else {
+    const commentRes = http.post(
+      `${BASE}/posts/${postId}/comments`,
+      JSON.stringify({ content: 'benchmark load test comment' }),
+      Object.assign({}, userHeaders, { tags: { name: 'POST /posts/:id/comments' } })
     );
-    check(comRes, { 'comment is 201': (r) => r.status === 201 });
+    check(commentRes, {
+      'comment status is 201': (r) => r.status === 201,
+      'comment response has post_id': (r) => r.json('comment.post_id') === postId,
+    });
   }
   sleep(thinkSeconds());
 
-  // 4. GET /users/:username - a counted profile visit, and a durable write
-  const profRes = http.get(`${BASE}/users/${username}`, { tags: { name: 'GET /users/:username' } });
-  check(profRes, { 'profile is 200': (r) => r.status === 200 });
-  sleep(thinkSeconds()); // end-of-loop pause, then the VU starts again
+  // 4. GET /users/:username (Profile visit and counted write)
+  const targetUser = data.tokens[Math.floor(Math.random() * data.tokens.length)].username;
+  const profRes = http.get(`${BASE}/users/${targetUser}`, { tags: { name: 'GET /users/:username' } });
+  check(profRes, {
+    'profile status is 200': (r) => r.status === 200,
+    'profile username matches': (r) => r.json('user.username') === targetUser,
+  });
+  sleep(thinkSeconds());
 }

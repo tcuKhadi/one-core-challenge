@@ -5,16 +5,42 @@ The app for the challenge: a tiny social app with posts, likes, comments, and pr
 ## Basics
 - Base URL: `http://<host>:8080`
 - All request and response bodies are JSON (`Content-Type: application/json`).
-- `id` of a post is an integer. `username` is a lowercase string, letters, numbers, and underscores only, 1 to 32 characters.
-- Post content is 1 to 280 characters. Comment content is 1 to 280 characters.
-- Unknown path returns `404`. Known path with wrong method returns `405`.
-- Error body is always `{"error": "message"}`.
-- Storage is SQLite, inside the app.
+- A post `id` is an integer. On a fresh database, ids are assigned 1, 2, 3, ... in creation order.
+- `username` is a lowercase string: letters, numbers, and underscores only, 1 to 32 characters (`^[a-z0-9_]{1,32}$`).
+- Post and comment `content` is 1 to 280 characters, counted as Unicode characters, not bytes. Content that is empty or only whitespace is invalid.
+- Timestamps are UTC, RFC 3339, whole seconds, for example `2026-11-06T10:00:00Z`. Lists that sort by time break ties by creation order, newest first.
+- Unknown path returns `404`. Known path with the wrong method returns `405`. Both use the standard error body.
+- Error body is always `{"error": "message"}`. The checks only look at the status code and that `error` is a non-empty string; the message text is free.
+- Storage is in-process SQLite. See [rules.md](rules.md) for how it must be used.
+- A completed write is visible to the next read.
+
+## Authentication
+Three routes need a token: `POST /posts`, `POST /posts/:id/like`, and `POST /posts/:id/comments`. Every read is public.
+
+- Header: `Authorization: Bearer <token>`
+- The token is a JWT signed with HS256. The secret comes from the `JWT_SECRET` environment variable (benchmark default: `one-core-challenge-secret`).
+- Payload: `sub` is the username acting, `exp` is the expiry in Unix epoch seconds.
+- The server checks the signature and `exp` on every protected request. Any algorithm other than HS256, including `none`, is invalid.
+- The acting username always comes from `sub`. Request bodies never carry a username.
+- Missing header, or not a Bearer token: `401`.
+- Bad signature, malformed token, expired token, or a `sub` that is not a valid username: `401`.
+- There is no register or login endpoint. The test scripts create tokens ([lib/token.js](lib/token.js), [lib/token.sh](lib/token.sh)).
+
+## Users
+A user exists once they have made their first successful write: a post, a comment, or a like. Before that, `GET /users/:username` returns `404`.
+
+## Order of checks
+1. Route: `404` unknown path, `405` wrong method
+2. Token: `401` (protected routes only)
+3. Body: `400` (routes that take a body)
+4. Post lookup: `404`
+
+A `:id` that is not a positive integer returns `404`.
 
 ## Endpoints
 
 ### 1. GET /feed
-Newest posts first. Replies `200`:
+The 20 newest posts, newest first. Sorted by `created_at` descending, then `id` descending. Replies `200`:
 
 ```json
 {
@@ -25,61 +51,92 @@ Newest posts first. Replies `200`:
 }
 ```
 
-- Sorted by `created_at`, newest first.
-- No pagination for the challenge build. An empty feed returns `{"posts": []}`.
+- An empty feed returns `{"posts": []}`.
 
 ### 2. POST /posts
-Create a post. Request body:
+Protected (needs a token). Request body:
 
 ```json
-{ "username": "mia", "content": "hello world" }
+{ "content": "hello world" }
 ```
 
 Replies `201` with the created post:
 
 ```json
-{ "id": 7, "username": "mia", "content": "hello world", "likes": 0, "comments": 0, "created_at": "2026-11-06T10:00:00Z" }
+{
+  "post": {
+    "id": 7,
+    "username": "mia",
+    "content": "hello world",
+    "likes": 0,
+    "comments": 0,
+    "created_at": "2026-11-06T10:00:00Z"
+  }
+}
 ```
 
-- Missing or invalid `username` or `content` returns `400` with `{"error": "..."}`.
-- The post is saved to disk before the reply is sent.
+- Missing or invalid `content` returns `400`.
+- The post is committed and synced to disk before the reply is sent.
 
 ### 3. GET /posts/:id
 One post, with its like and comment counts. Replies `200`:
 
 ```json
-{ "id": 7, "username": "mia", "content": "hello world", "likes": 3, "comments": 1, "created_at": "2026-11-06T10:00:00Z" }
+{
+  "post": {
+    "id": 7,
+    "username": "mia",
+    "content": "hello world",
+    "likes": 3,
+    "comments": 1,
+    "created_at": "2026-11-06T10:00:00Z"
+  }
+}
 ```
 
-- Unknown `id` returns `404` with `{"error": "post not found"}`.
+- Unknown `id` returns `404`.
 
 ### 4. POST /posts/:id/like
-Like a post. No request body needed.
+Protected (needs a token). No request body. One user can like a post once.
 
-- Replies `201` with the new total: `{"post_id": 7, "likes": 4}`
-- One request adds exactly one like. Liking twice is allowed and counts twice.
-- Unknown `id` returns `404` with `{"error": "post not found"}`.
-- The like is saved to disk before the reply is sent (durable write).
+- First like by this user on this post: `201`
+- Liking again: `200`, and the count does not change
 
-### 5. POST /posts/:id/comments
-Add a comment. Request body:
+Both reply with the current total:
 
 ```json
-{ "username": "sam", "content": "nice post" }
+{ "post_id": 7, "likes": 4 }
+```
+
+- Unknown `id` returns `404`.
+- A first like is committed and synced to disk before the reply is sent.
+
+### 5. POST /posts/:id/comments
+Protected (needs a token). Request body:
+
+```json
+{ "content": "nice post" }
 ```
 
 Replies `201` with the created comment:
 
 ```json
-{ "post_id": 7, "username": "sam", "content": "nice post", "created_at": "2026-11-06T10:05:00Z" }
+{
+  "comment": {
+    "post_id": 7,
+    "username": "sam",
+    "content": "nice post",
+    "created_at": "2026-11-06T10:05:00Z"
+  }
+}
 ```
 
-- Missing or invalid `username` or `content` returns `400` with `{"error": "..."}`.
-- Unknown `id` returns `404` with `{"error": "post not found"}`.
-- The comment is saved to disk before the reply is sent.
+- Missing or invalid `content` returns `400`.
+- Unknown `id` returns `404`.
+- The comment is committed and synced to disk before the reply is sent.
 
 ### 6. GET /posts/:id/comments
-List a post's comments, oldest first. Replies `200`:
+The 20 newest comments on a post, newest first. Sorted by `created_at` descending, then comment creation order descending. Replies `200`:
 
 ```json
 {
@@ -90,24 +147,33 @@ List a post's comments, oldest first. Replies `200`:
 ```
 
 - No comments yet returns `{"comments": []}`.
-- Unknown `id` returns `404` with `{"error": "post not found"}`.
+- Unknown `id` returns `404`.
 
 ### 7. GET /users/:username
 Profile page. Each successful request counts as one profile visit. Replies `200`:
 
 ```json
-{ "username": "mia", "post_count": 4, "profile_visits": 37 }
+{
+  "user": {
+    "username": "mia",
+    "post_count": 4,
+    "profile_visits": 37
+  }
+}
 ```
 
-- The visit count is incremented and saved to disk before the reply is sent.
-- Unknown `username` returns `404` with `{"error": "user not found"}`.
+- `profile_visits` includes the visit being made right now.
+- The visit is incremented and synced to disk before the reply is sent.
+- Unknown `username` returns `404`.
+- `post_count` is the total number of posts created by this user.
 
 ## Status code summary
 
 | Code | When |
 | --- | --- |
-| 200 | Successful read |
-| 201 | Successful create or like |
+| 200 | Successful read, or repeat like |
+| 201 | Successful create or first like |
 | 400 | Invalid request body |
+| 401 | Missing, malformed, or expired token |
 | 404 | Unknown path, post, or user |
 | 405 | Known path, wrong method |

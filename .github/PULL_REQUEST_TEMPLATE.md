@@ -1,14 +1,18 @@
-<!--
-One entry per PR. Only add or change files inside entries/<your-github-username>/.
-Bootstrap: entries/<your-github-username>/Dockerfile (the app listens on 8080 in the container).
--->
+Submission Checklist
 
-**Entry folder:** `entries/<your-github-username>/`
+Please verify each item before opening your pull request:
+[ ] All submission files are contained strictly inside entries/<your-github-username>/.
+[ ] No files outside your folder (like root config, rules, or test harnesses) have been modified.
+[ ] Your entry includes a working Dockerfile that builds and starts the application listening on port 8080.
+[ ] Reads the JWT signing secret directly from the JWT_SECRET environment variable.
+[ ] Uses in-process SQLite with a single database file residing on the container's own filesystem (no /dev/shm, tmpfs, or memory mode).
+[ ] Configured with synchronous = FULL or EXTRA, and journal_mode = WAL | DELETE | TRUNCATE | PERSIST on every connection.
+[ ] Every write (posts, comments, first likes, and profile visits) is committed and synced to disk before the HTTP response is sent.
+[ ] Local verification passes: ./spec-check.sh <container-name> exits with 0 failures, including the kill -9 durability crash test.
 
-**Language / runtime:**
+Stack Details
+Language / Runtime:
 
-**SQLite approach (journal mode, synchronous setting, where the file lives):**
+SQLite Driver / Library:
 
-**One lesson you learned about the box (helps the video):**
-
-By opening this PR I accept [rules.md](../../rules.md): fsync every write before replying, cold start every run, survive kill -9, no load-test detection.
+Concurrency / Architecture Notes (Optional):

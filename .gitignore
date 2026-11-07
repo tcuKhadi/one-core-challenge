@@ -1,0 +1,13 @@
+
+results/
+
+*.db
+
+*.db-wal
+
+*.db-shm
+
+*.log
+
+bin/
+

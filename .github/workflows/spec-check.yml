@@ -8,7 +8,8 @@ name: Spec check
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - "main"
     paths:
       - "entries/**"
       - "spec-check.sh"
@@ -16,16 +17,16 @@ on:
 
 jobs:
   spec-check:
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-latest"
     steps:
-      - uses: actions/checkout@v4
+      - uses: "actions/checkout@v4"
         with:
-          fetch-depth: 0  # full history so we can diff PR files
+          fetch-depth: 0
 
-      - name: Guard - one entry per PR, only inside entries/<username>/
+      - name: "Guard - one entry per PR, only inside entries/<username>/"
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
           changed=$(git diff --name-only "$BASE" "$HEAD")
           echo "Changed files:"
           echo "$changed"
@@ -38,23 +39,21 @@ jobs:
           fi
 
           dirs=$(echo "$changed" | grep '^entries/' | cut -d/ -f2 | sort -u)
-          count=$(echo "$dirs" | wc -l)
+          count=$(echo "$dirs" | grep -c . || true)
           if [ "$count" -ne 1 ]; then
             echo "::error::Exactly one entry folder per PR (entries/<username>), found $count."
             exit 1
           fi
           echo "entry=entries/$dirs" >> "$GITHUB_ENV"
 
-      - name: Build the entry
-        run: docker build -t entry "${{ env.entry }}"
+      - name: "Build the entry"
+        run: "docker build -t entry ${{ env.entry }}"
 
-      - name: Start with the standard command (no --rm: the kill -9 test needs the disk layer to survive)
+      - name: "Start with the standard command"
         run: |
-          docker run -d --name challenge \
-            --cpuset-cpus=0 --memory=2g --memory-swap=2g \
-            -p 8080:8080 entry
+          docker run -d --name challenge             --cpuset-cpus=0 --memory=2g --memory-swap=2g             -e JWT_SECRET=one-core-challenge-secret             -p 8080:8080 entry
 
-      - name: Wait for the app to come up
+      - name: "Wait for the app to come up"
         run: |
           for i in $(seq 1 30); do
             if curl -fsS -o /dev/null http://localhost:8080/feed; then
@@ -67,13 +66,15 @@ jobs:
           docker logs challenge
           exit 1
 
-      - name: Spec check (walks all seven endpoints + kill -9 durability test)
-        run: ./spec-check.sh challenge
+      - name: "Spec check"
+        run: |
+          chmod +x ./spec-check.sh
+          ./spec-check.sh challenge
 
-      - name: Container logs on failure
+      - name: "Container logs on failure"
         if: failure()
-        run: docker logs challenge
+        run: "docker logs challenge"
 
-      - name: Always clean up the container
+      - name: "Always clean up the container"
         if: always()
-        run: docker rm -f challenge
+        run: "docker rm -f challenge"
